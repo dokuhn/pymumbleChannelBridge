@@ -84,8 +84,7 @@ def sound_received_handler(user, soundchunk):
         chunkQueue.append(new_item)
 
 
-
-def mumble_thread_function(server, nick, password=pwd, room="LUGSaar (Treffen Do 18 Uhr 30)"):
+def mumble_thread_function(run_event, server, nick, password=pwd, room="LUGSaar (Treffen Do 18 Uhr 30)"):
 
     chunkBuffer = np.zeros(960,dtype=np.int16)
 
@@ -115,7 +114,7 @@ def mumble_thread_function(server, nick, password=pwd, room="LUGSaar (Treffen Do
             
             # constant capturing sound and sending it to mumble server
 
-            while True:
+            while run_event.is_set():
 
                 # minTime = 0x7FFFFFFF
                 # soundChunkAudioData = np.zeros(1920,dtype=np.int8)
@@ -158,7 +157,7 @@ def mumble_thread_function(server, nick, password=pwd, room="LUGSaar (Treffen Do
                 
 
                 # stream.write(soundChunkAudioData.tobytes())
-                time.sleep(1)
+                time.sleep(10)
 
 
     mumble.stop()
@@ -169,37 +168,48 @@ if __name__ == "__main__":
     logging.basicConfig(format=format, level=logging.INFO,
                         datefmt="%H:%M:%S")
 
+    run_event = threading.Event()
+    run_event.set()
+
     threads = list()
 
-    for index in range(1):
-        logging.info("Main    : create and start thread %d.", index)
-        x = threading.Thread(target=mumble_thread_function, args=(server,nicks[index],pwd,rooms[index]))
-        threads.append(x)
-        x.start()
+    # for index in range(1):
+    logging.info("Main    : create and start thread %d.", 0)
+    x = threading.Thread(target=mumble_thread_function, args=(run_event, server,nicks[0],pwd,rooms[0],))
+    threads.append(x)
+    x.start()
 
 
     time.sleep(0.5)
 
-    while True:
+    try:
 
-        minTime = 0x7FFFFFFF
-        soundChunkAudioData = np.zeros(1920,dtype=np.int8)
+        while True:
 
-        for _index in range(1,len(chunkQueue)):
-            if( not chunkQueue[_index]["soundchunk"]['time'].empty() and  (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= minTime)):
-                minTime = chunkQueue[_index]["soundchunk"]['time'].queue[0]
-        
-        for _index in range(1,len(chunkQueue)):
-            if( not chunkQueue[_index]["soundchunk"]['time'].empty() and  (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.020))):
-                pcmBuffer = chunkQueue[_index]["soundchunk"]['pcm'].get()
-                timeBuffer = chunkQueue[_index]["soundchunk"]['time'].get()
-                timestampBuffer = chunkQueue[_index]["soundchunk"]['timestamp'].get()
+            minTime = 0x7FFFFFFF
+            soundChunkAudioData = np.zeros(1920,dtype=np.int8)
 
-                pcmBuffer = np.frombuffer(pcmBuffer, dtype=np.int8)
-                soundChunkAudioData = np.add(soundChunkAudioData, pcmBuffer>>1)
+            for _index in range(1,len(chunkQueue)):
+                if( not chunkQueue[_index]["soundchunk"]['time'].empty() and  (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= minTime)):
+                    minTime = chunkQueue[_index]["soundchunk"]['time'].queue[0]
+            
+            for _index in range(1,len(chunkQueue)):
+                if( not chunkQueue[_index]["soundchunk"]['time'].empty() and  (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.020))):
+                    pcmBuffer = chunkQueue[_index]["soundchunk"]['pcm'].get()
+                    timeBuffer = chunkQueue[_index]["soundchunk"]['time'].get()
+                    timestampBuffer = chunkQueue[_index]["soundchunk"]['timestamp'].get()
 
-        stream.write(soundChunkAudioData.tobytes())
-        
+                    pcmBuffer = np.frombuffer(pcmBuffer, dtype=np.int8)
+                    soundChunkAudioData = np.add(soundChunkAudioData, pcmBuffer>>1)
+
+            stream.write(soundChunkAudioData.tobytes())
+
+    except KeyboardInterrupt:
+
+        logging.info("attempting to close threads")
+        run_event.clear()
+        x.join()
+        logging.info("threads successfully closed")    
 
     # for index, thread in enumerate(threads):
     #     logging.info("Main    : before joining thread %d.", index)
@@ -207,7 +217,9 @@ if __name__ == "__main__":
     #     logging.info("Main    : thread %d done", index)
 
     # close the stream and pyaudio instance
+    logging.info("close the stream and pyaudio instance")
     stream.stop_stream()
     stream.close()
     p.terminate()
 
+    
