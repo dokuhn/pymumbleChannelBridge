@@ -4,17 +4,20 @@ import threading
 import time
 import pymumble_py3
 from pymumble_py3.callbacks import PYMUMBLE_CLBK_SOUNDRECEIVED as PCS
-import pyaudio
 
 import queue
 import numpy as np
 import scipy.interpolate as interp
+from scipy import signal
 
+from helpers import CustomLogger
 
 # Connection details for mumble server. Hardcoded for now, will have to be
-# command line arguments eventually
+# command line arguments eventually later
 pwd = ""  # password
 server = "mumble.lug-saar.de"
+
+
 
 chunkQueue = [
     {
@@ -24,43 +27,39 @@ chunkQueue = [
             'name': str,
         },
         'soundchunk': {
+            'duration': queue.Queue(),
             'pcm': queue.Queue(),
+            'sequence': queue.Queue(),
+            'size': queue.Queue(),
             'time': queue.Queue(),
-            'timestamp': queue.Queue()
+            'timestamp': queue.Queue(),
+            'type': queue.Queue()
         }
     }
 ]
 
-# pyaudio set up
-CHUNK = 1024
-FORMAT = pyaudio.paInt16  # pymumble soundchunk.pcm is 16 bits
-CHANNELS = 1
-RATE = 48000  # pymumble soundchunk.pcm is 48000Hz
-
-p = pyaudio.PyAudio()
-
-stream = p.open(format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=False,  # enable both talk
-                output=True,  # and listen
-                frames_per_buffer=CHUNK)
 
 def room1_sound_received_handler(user, soundchunk):
-    """ stores sounds received from mumble server in a threadsafe queue """    
+    """ callback function to store received sounds chunks from mumble server in a threadsafe queue """    
     
     index = None
-    # search for an existing dict in chunkQeue object
+    # search for a user entry in the dict and keep the index of it 
+    # if the user cannot be found in the dict, der index retains the initial value = None
     for _index in range(1,len(chunkQueue)):
         
         if(user['name'] == chunkQueue[_index]['user']['name']):
+            chunkQueue[_index]['soundchunk']['duration'].put(soundchunk.duration)
             chunkQueue[_index]['soundchunk']['pcm'].put(soundchunk.pcm)
+            chunkQueue[_index]['soundchunk']['sequence'].put(soundchunk.sequence)
+            chunkQueue[_index]['soundchunk']['size'].put(soundchunk.size)
             chunkQueue[_index]['soundchunk']['time'].put(soundchunk.time)
             chunkQueue[_index]['soundchunk']['timestamp'].put(soundchunk.timestamp)
+            chunkQueue[_index]['soundchunk']['type'].put(soundchunk.type)
             index = _index
             break
     
-    # if there is no exsisting dict in chunkQeue add one for the user                
+    # the search for a user in dict was unsuccessful (index value = None), 
+    # a new entry is added to the end for the current user            
     if(not index):
         new_item = {
             'user': {
@@ -69,15 +68,21 @@ def room1_sound_received_handler(user, soundchunk):
                 'name': user['name'],
             },
             'soundchunk': {
+                'duration': queue.Queue(),
                 'pcm': queue.Queue(),
+                'sequence': queue.Queue(),
+                'size': queue.Queue(),
                 'time': queue.Queue(),
-                'timestamp': queue.Queue()
+                'timestamp': queue.Queue(),
+                'type': queue.Queue()
             }
         }
         chunkQueue.append(new_item)
 
 
+
 def room1_thread_function(run_event, server=server, nick="luftbrueckeRaum1", password=pwd, room="Raum 1"):
+    """ first thread function to run the mumble client for one channel at the time """
 
     mumble = pymumble_py3.Mumble(server, nick, password=pwd)
 
@@ -97,22 +102,18 @@ def room1_thread_function(run_event, server=server, nick="luftbrueckeRaum1", pas
 
         if(len(LUGSaarRoomCh) >= 0):
             LUGSaarRoomCh.move_in()
-
-            while run_event.is_set():
-           
-                time.sleep(60)
-
-
+            
+            ticker = threading.Event()
+            while run_event.is_set() and not ticker.wait(0.06):
+                pass 
+            
     mumble.stop()
 
 
-def room2_thread_function(run_event, server=server, nick="luftbrueckeRaum2", password=pwd, room="Raum 2"):
+def room2_thread_function(run_event,server=server, nick="luftbrueckeRaum2", password=pwd, room="Raum 2"):
+    """ second thread function to run the mumble client for one channel at the time """
 
     mumble = pymumble_py3.Mumble(server, nick, password=pwd)
-
-    # set up callback called when PCS event occurs
-    # mumble.callbacks.set_callback(PCS, room1_sound_received_handler)
-    # mumble.set_receive_sound(1)  # Enable receiving sound from mumble server
     
     mumble.start()
     mumble.is_ready()
@@ -127,10 +128,12 @@ def room2_thread_function(run_event, server=server, nick="luftbrueckeRaum2", pas
         if(len(LUGSaarRoomCh) >= 0):
             LUGSaarRoomCh.move_in()
 
-            while run_event.is_set():
+            ticker = threading.Event()
+            while run_event.is_set() and not ticker.wait(0.06):
 
-                minTime = 0x7FFFFFFF
-                soundChunkAudioData = np.zeros(1920,dtype=np.int8)
+    
+                soundChunkAudioData = np.zeros(5760, dtype=np.int8)
+                                     
 
                 for _index in range(1,len(chunkQueue)):
                     if( not chunkQueue[_index]["soundchunk"]['time'].empty() and (_index == 1)):
@@ -139,59 +142,110 @@ def room2_thread_function(run_event, server=server, nick="luftbrueckeRaum2", pas
                     if( not chunkQueue[_index]["soundchunk"]['time'].empty() and (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= minTime)):
                         minTime = chunkQueue[_index]["soundchunk"]['time'].queue[0]
                 
+
                 for _index in range(1,len(chunkQueue)):
 
-                    if( not chunkQueue[_index]["soundchunk"]['time'].empty() and (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.010)) ):
-                        pcmBuffer0 = chunkQueue[_index]["soundchunk"]['pcm'].get()
-                        timeBuffer0 = chunkQueue[_index]["soundchunk"]['time'].get()
-                        timestampBuffer0 = chunkQueue[_index]["soundchunk"]['timestamp'].get()
+                    durBuffer = []
+                    pcmBuffer = []
+                    seqBuffer = []
+                    sizeBuffer = []
+                    timeBuffer = []
+                    timestampBuffer = []
+                    typeBuffer = []
 
-                        pcmBuffer1 = chunkQueue[_index]["soundchunk"]['pcm'].get()
-                        timeBuffer1 = chunkQueue[_index]["soundchunk"]['time'].get()
-                        timestampBuffer1 = chunkQueue[_index]["soundchunk"]['timestamp'].get()
-                     
-                        pcmBuffer0 = np.frombuffer(pcmBuffer0, dtype=np.int8)
-                        pcmBuffer1 = np.frombuffer(pcmBuffer1, dtype=np.int8)
+                    pcmNPBuffer = np.array([],dtype=np.int8)
 
-                        pcmBuffer = np.concatenate( [pcmBuffer0, pcmBuffer1] )
-
-                        pcmBuffer_L = pcmBuffer[0::2].copy()
-                        pcmBuffer_R = pcmBuffer[1::2].copy()
-
-
-                        pcmBuffer_interp_L = interp.interp1d(np.arange(pcmBuffer_L.size),pcmBuffer_L)
-                        arr1_compress_L = pcmBuffer_interp_L(np.linspace(0,pcmBuffer_L.size-1,soundChunkAudioData.size/2))
-
-                        pcmBuffer_interp_R = interp.interp1d(np.arange(pcmBuffer_R.size),pcmBuffer_R)
-                        arr1_compress_R = pcmBuffer_interp_R(np.linspace(0,pcmBuffer_R.size-1,soundChunkAudioData.size/2))
-
-
-                        pcmBuffer[0::2] = np.int8(arr1_compress_L)  # np.concatenate((arr1_compress_L[0::1],arr1_compress_R[1::1]),None)
-                        pcmBuffer[1::2] = np.int8(arr1_compress_R)
-                        # pcmBuffer = np.append(pcmBuffer, pcmBuffer[0])
-                        # pcmBuffer = np.ravel(np.vstack((pcmBuffer_interp_L, pcmBuffer_interp_R)), order='F')
-
-                        # pcmBuffer_interp = interp.interp1d(np.arange(pcmBuffer.size),pcmBuffer)
-                        # pcmBuffer_stretch = pcmBuffer_interp(np.linspace(0,pcmBuffer.size-1, soundChunkAudioData.size))
-
-                        # pcmBuffer_stretch = np.frombuffer(pcmBuffer_stretch, dtype=np.int8)
-                        soundChunkAudioData = np.add(soundChunkAudioData, pcmBuffer)
-                    
-
-                    elif( not chunkQueue[_index]["soundchunk"]['time'].empty() and (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.020))):
-                        pcmBuffer = chunkQueue[_index]["soundchunk"]['pcm'].get()
-                        timeBuffer = chunkQueue[_index]["soundchunk"]['time'].get()
-                        timestampBuffer = chunkQueue[_index]["soundchunk"]['timestamp'].get()
-
-                        pcmBuffer = np.frombuffer(pcmBuffer, dtype=np.int8)
-                        soundChunkAudioData = np.add(soundChunkAudioData, pcmBuffer)
-
-                    
-
+                    # opus supports frames with: 2.5, 5, 10, 20, 40 or 60 ms of audio data.
+                    # so we have to assume the worst case and take one from the queue in the case of a 60ms frame. 
+                    if((not chunkQueue[_index]["soundchunk"]['pcm'].empty()) and 
+                       (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.0600)) and 
+                       (chunkQueue[_index]["soundchunk"]['duration'].queue[0] == 0.06)):
                         
-                # stream.write(soundChunkAudioData.tobytes())
-                mumble.sound_output.add_sound( soundChunkAudioData.tobytes() )
-                time.sleep(0.021)
+                      
+                        durBuffer.append(chunkQueue[_index]["soundchunk"]['duration'].get())
+                        pcmBuffer.append(chunkQueue[_index]["soundchunk"]['pcm'].get())
+                        seqBuffer.append(chunkQueue[_index]["soundchunk"]['sequence'].get())
+                        sizeBuffer.append(chunkQueue[_index]["soundchunk"]['size'].get())
+                        timeBuffer.append(chunkQueue[_index]["soundchunk"]['time'].get())
+                        timestampBuffer.append(chunkQueue[_index]["soundchunk"]['timestamp'].get())
+                        typeBuffer.append(chunkQueue[_index]["soundchunk"]['type'].get())
+                       
+                        pcmNPBuffer =  np.append(pcmNPBuffer, np.frombuffer( pcmBuffer[0], dtype=np.int8))
+
+                        ####################################################################################################################################
+                        ####### historically, if the individual sound chunks have a different sampling rate, they must be resampled to a common rate #######
+
+                        # pcmNPBuffer = np.reshape(pcmNPBuffer, (-1,2))
+
+                        # if( len(pcmNPBuffer) < len(soundChunkAudioData)/2 ):
+                        #     upsampling_factor   = len(soundChunkAudioData)/(2*len(pcmNPBuffer))
+                        #     downsampling_factor = len(pcmNPBuffer)
+                        #     pcmResampleBuffer = signal.resample_poly(pcmNPBuffer, upsampling_factor, downsampling_factor, axis=1) 
+                        # elif( len(pcmNPBuffer) > len(soundChunkAudioData)/2  ):
+                        #     upsampling_factor   = len(pcmNPBuffer)
+                        #     downsampling_factor = len(soundChunkAudioData)/(2)
+                        #     pcmResampleBuffer = signal.resample_poly(pcmNPBuffer, upsampling_factor, downsampling_factor, axis=1) 
+
+
+                        # pcmNPBuffer = np.reshape(pcmNPBuffer, (-1,1))
+                        # pcmNPBuffer = pcmNPBuffer.flatten()
+
+
+                        soundChunkAudioData = np.add(soundChunkAudioData, pcmNPBuffer)
+
+
+                    elif((not chunkQueue[_index]["soundchunk"]['pcm'].empty()) and 
+                         (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.0600)) and 
+                         (chunkQueue[_index]["soundchunk"]['duration'].queue[0] == 0.02) and
+                         (chunkQueue[_index]["soundchunk"]['pcm'].qsize() >= 3)):
+
+                        for nmbOfValues2Get in range(3):
+                            if(chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.0600)):
+                                durBuffer.append(chunkQueue[_index]["soundchunk"]['duration'].get())
+                                pcmBuffer.append(chunkQueue[_index]["soundchunk"]['pcm'].get())
+                                seqBuffer.append(chunkQueue[_index]["soundchunk"]['sequence'].get())
+                                sizeBuffer.append(chunkQueue[_index]["soundchunk"]['size'].get())
+                                timeBuffer.append(chunkQueue[_index]["soundchunk"]['time'].get())
+                                timestampBuffer.append(chunkQueue[_index]["soundchunk"]['timestamp'].get())
+                                typeBuffer.append(chunkQueue[_index]["soundchunk"]['type'].get())
+
+                        for nmbOfValues2Get in range(len(pcmBuffer)):
+                            pcmNPBuffer =  np.append(pcmNPBuffer, np.frombuffer( pcmBuffer[nmbOfValues2Get], dtype=np.int8))
+                        
+                        if pcmNPBuffer.size < soundChunkAudioData.size:
+                            difference = soundChunkAudioData.size - pcmNPBuffer.size
+                            pcmNPBuffer = np.pad(pcmNPBuffer, (0,difference), 'constant')
+
+                        soundChunkAudioData = np.add(soundChunkAudioData, pcmNPBuffer)
+                  
+
+                    elif((not chunkQueue[_index]["soundchunk"]['pcm'].empty()) and 
+                        (chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.0600)) and 
+                        (chunkQueue[_index]["soundchunk"]['duration'].queue[0] == 0.01) and
+                        (chunkQueue[_index]["soundchunk"]['pcm'].qsize() >= 6)):
+
+                        for nmbOfValues2Get in range(6):
+                            if(chunkQueue[_index]["soundchunk"]['time'].queue[0] <= (minTime + 0.0600)):
+                                durBuffer.append(chunkQueue[_index]["soundchunk"]['duration'].get())
+                                pcmBuffer.append(chunkQueue[_index]["soundchunk"]['pcm'].get())
+                                seqBuffer.append(chunkQueue[_index]["soundchunk"]['sequence'].get())
+                                sizeBuffer.append(chunkQueue[_index]["soundchunk"]['size'].get())
+                                timeBuffer.append(chunkQueue[_index]["soundchunk"]['time'].get())
+                                timestampBuffer.append(chunkQueue[_index]["soundchunk"]['timestamp'].get())
+                                typeBuffer.append(chunkQueue[_index]["soundchunk"]['type'].get())
+
+                        for nmbOfValues2Get in range(len(pcmBuffer)):
+                            pcmNPBuffer =  np.append(pcmNPBuffer, np.frombuffer( pcmBuffer[nmbOfValues2Get], dtype=np.int8))
+
+                        if pcmNPBuffer.size < soundChunkAudioData.size:
+                            difference = soundChunkAudioData.size - pcmNPBuffer.size
+                            pcmNPBuffer = np.pad(pcmNPBuffer, (0,difference), 'constant')
+
+                        soundChunkAudioData = np.add(soundChunkAudioData, pcmNPBuffer)
+                
+                if np.count_nonzero( soundChunkAudioData ) != 0:
+                    mumble.sound_output.add_sound( soundChunkAudioData.tobytes() )
+              
 
 
 
@@ -199,26 +253,25 @@ def room2_thread_function(run_event, server=server, nick="luftbrueckeRaum2", pas
 
 
 if __name__ == "__main__":
-    format = "%(asctime)s: %(message)s"
-    logging.basicConfig(format=format, level=logging.INFO,
-                        datefmt="%H:%M:%S")
 
+    logger = CustomLogger()
+
+    logger.info("Test Info Message !!!!")
+    logger.debug("Test Debug Message !!!!")
+    logger.warning("Test Waring Message !!!!")
+    logger.error("Test Error Message !!!!")
+
+    # create a common thread event to control them with each other
     run_event = threading.Event()
     run_event.set()
-
-    # for index in range(1):
-    logging.info("Main    : create and start thread to receive sounds in room1")
+  
+  
     thread1 = threading.Thread(target=room1_thread_function, args=(run_event,))
-    thread1.start()
-
-    time.sleep(0.5)
-
-    logging.info("Main    : create and start thread to send sounds back to server in room2")
     thread2 = threading.Thread(target=room2_thread_function, args=(run_event,))
+    logger.debug("create and start thread to receive sounds in room1")
+    logger.debug("create and start thread to send sounds back to server in room2")
+    thread1.start()
     thread2.start()
-
-
-    
 
     try:
 
@@ -228,21 +281,10 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        logging.info("attempting to close threads")
+        logger.debug("attempting to close threads")
         run_event.clear()
         thread1.join()
         thread2.join()
-        logging.info("threads successfully closed")    
-
-    # for index, thread in enumerate(threads):
-    #     logging.info("Main    : before joining thread %d.", index)
-    #     thread.join()
-    #     logging.info("Main    : thread %d done", index)
-
-    # close the stream and pyaudio instance
-    logging.info("close the stream and pyaudio instance")
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+        logger.debug("threads successfully closed")
 
     
